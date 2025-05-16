@@ -49,6 +49,9 @@ jobs:
       - name: Run tests
         run: npm test
         
+      - name: Create test results directory
+        run: mkdir -p test-results coverage
+        
       - name: Upload test results
         uses: actions/upload-artifact@v4
         with:
