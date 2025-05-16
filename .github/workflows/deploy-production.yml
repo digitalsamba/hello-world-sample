@@ -1,0 +1,140 @@
+name: Deploy to Production
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'  # Trigger on semantic version tags (e.g., 1.0.0)
+
+# Default configurations if not provided in secrets
+env:
+  DEFAULT_PORT: 3000         # Default internal port the app listens on
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy to Production
+    runs-on: ubuntu-latest
+    environment: production  # Use production environment and its secrets
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+          
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+          
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${{ secrets.APP_NAME }}:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_ENV=production
+          
+      - name: Deploy to production server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_KEY }}
+          port: 22
+          script: |
+            # Set variables
+            APP_NAME="${{ secrets.APP_NAME }}"
+            CONTAINER_NAME="${APP_NAME}-prod"
+            VERSION="${{ github.ref_name }}"
+            IMAGE_NAME="docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${APP_NAME}:${VERSION}"
+            
+            # Set deployment directory
+            DEPLOY_PATH="/opt/deployment/${APP_NAME}-prod"
+            
+            sudo mkdir -p $DEPLOY_PATH
+            cd $DEPLOY_PATH
+            
+            # Create directories for persistent data if they don't exist
+            sudo mkdir -p $DEPLOY_PATH/data
+            sudo mkdir -p $DEPLOY_PATH/logs
+            
+            echo "Pulling production Docker image..."
+            sudo docker pull $IMAGE_NAME
+            
+            echo "Stopping and removing existing container (if any)..."
+            sudo docker stop $CONTAINER_NAME || true
+            sudo docker rm $CONTAINER_NAME || true
+            
+            echo "Starting new container..."
+            sudo docker run -d \
+              --name $CONTAINER_NAME \
+              --restart unless-stopped \
+              -p ${{ secrets.PORT }}:${{ env.DEFAULT_PORT }} \
+              -e NODE_ENV=production \
+              -e VIRTUAL_HOST=${{ secrets.DOMAIN }} \
+              -e VIRTUAL_PORT=${{ env.DEFAULT_PORT }} \
+              -e LETSENCRYPT_HOST=${{ secrets.DOMAIN }} \
+              -e LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }} \
+              -v $DEPLOY_PATH/data:/app/data \
+              -v $DEPLOY_PATH/logs:/app/logs \
+              --network ${{ secrets.DOCKER_NETWORK }} \
+              $IMAGE_NAME
+            
+            # Clean up old images to save space
+            sudo docker image prune -a --filter "label=name=$APP_NAME" --filter "until=720h" --force
+            
+            echo "Deployment to production completed."
+          
+      - name: Verify deployment
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_KEY }}
+          port: 22
+          script: |
+            # Set variables
+            APP_NAME="${{ secrets.APP_NAME }}"
+            CONTAINER_NAME="${APP_NAME}-prod"
+            VERSION="${{ github.ref_name }}"
+            
+            # Wait for the container to be ready
+            sleep 15
+            
+            # Check if the container is running
+            if sudo docker ps | grep $CONTAINER_NAME; then
+              echo "Container is running"
+              
+              # Perform a basic health check
+              if curl -s http://localhost:${{ secrets.PORT }} | grep -q "Hello"; then
+                echo "Local health check passed"
+              else
+                echo "Warning: Local health check did not detect expected content"
+                echo "Container logs:"
+                sudo docker logs $CONTAINER_NAME --tail 50
+              fi
+              
+              # Then check using the domain
+              echo "Attempting domain health check"
+              if curl -s https://${{ secrets.DOMAIN }} -k | grep -q "Hello"; then
+                echo "Domain health check passed"
+              else
+                echo "Warning: Domain health check did not detect expected content"
+                echo "This might be normal if DNS hasn't propagated or SSL certificate isn't ready yet"
+              fi
+              
+              echo "✅ Deployment to production was successful!"
+              echo "App: $APP_NAME"
+              echo "Version: $VERSION"
+              echo "Available at: https://${{ secrets.DOMAIN }}"
+            else
+              echo "❌ Container is not running"
+              sudo docker logs $CONTAINER_NAME || echo "No logs available"
+              exit 1
+            fi

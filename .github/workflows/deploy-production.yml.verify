@@ -1,0 +1,47 @@
+      - name: Verify deployment
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_KEY }}
+          port: 22
+          script: |
+            # Set variables
+            APP_NAME="${{ env.APP_NAME }}"
+            CONTAINER_NAME="${APP_NAME}-prod"
+            VERSION="${{ github.ref_name }}"
+            
+            # Wait for the container to be ready
+            sleep 15
+            
+            # Check if the container is running
+            if sudo docker ps | grep $CONTAINER_NAME; then
+              echo "Container is running"
+              
+              # Perform a basic health check
+              if curl -s http://localhost:${{ secrets.PORT }} | grep -q "Hello"; then
+                echo "Local health check passed"
+              else
+                echo "Warning: Local health check did not detect expected content"
+                echo "Container logs:"
+                sudo docker logs $CONTAINER_NAME --tail 50
+              fi
+              
+              # Then check using the domain
+              echo "Attempting domain health check"
+              if curl -s https://${{ secrets.PROD_DOMAIN }} -k | grep -q "Hello"; then
+                echo "Domain health check passed"
+              else
+                echo "Warning: Domain health check did not detect expected content"
+                echo "This might be normal if DNS hasn't propagated or SSL certificate isn't ready yet"
+              fi
+              
+              echo "✅ Deployment to production was successful!"
+              echo "App: $APP_NAME"
+              echo "Version: $VERSION"
+              echo "Available at: https://${{ secrets.PROD_DOMAIN }}"
+            else
+              echo "❌ Container is not running"
+              sudo docker logs $CONTAINER_NAME || echo "No logs available"
+              exit 1
+            fi

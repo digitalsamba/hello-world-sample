@@ -13,9 +13,8 @@ on:
         options:
           - development
 
-# Application-specific configurations
+# Default configurations if not provided in secrets
 env:
-  APP_NAME: hello-world-app  # Change this for different applications
   DEFAULT_PORT: 3000         # Default internal port the app listens on
 
 jobs:
@@ -80,8 +79,8 @@ jobs:
           context: .
           push: true
           tags: |
-            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${{ env.APP_NAME }}:dev-${{ github.sha }}
-            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${{ env.APP_NAME }}:development
+            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${{ secrets.APP_NAME }}:dev-${{ github.sha }}
+            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${{ secrets.APP_NAME }}:development
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -102,17 +101,19 @@ jobs:
           port: 22
           script: |
             # Set variables
-            APP_NAME="${{ env.APP_NAME }}"
+            APP_NAME="${{ secrets.APP_NAME }}"
             CONTAINER_NAME="${APP_NAME}-dev"
-            IMAGE_NAME="docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${{ env.APP_NAME }}:dev-${{ github.sha }}"
+            IMAGE_NAME="docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${APP_NAME}:dev-${{ github.sha }}"
             
-            # Create deployment directory if it doesn't exist
-            sudo mkdir -p ${{ secrets.DEPLOY_PATH }}
-            cd ${{ secrets.DEPLOY_PATH }}
+            # Set deployment directory
+            DEPLOY_PATH="/opt/deployment/${APP_NAME}-dev"
+            
+            sudo mkdir -p $DEPLOY_PATH
+            cd $DEPLOY_PATH
             
             # Create directories for persistent data if they don't exist
-            sudo mkdir -p ${{ secrets.DEPLOY_PATH }}/data
-            sudo mkdir -p ${{ secrets.DEPLOY_PATH }}/logs
+            sudo mkdir -p $DEPLOY_PATH/data
+            sudo mkdir -p $DEPLOY_PATH/logs
             
             # Pull the latest image
             sudo docker pull ${IMAGE_NAME}
@@ -122,17 +123,18 @@ jobs:
             sudo docker rm ${CONTAINER_NAME} || true
             
             # Run the new container with docker run
+            echo "Starting new container..."
             sudo docker run -d \
               --name ${CONTAINER_NAME} \
               --restart unless-stopped \
               -p ${{ secrets.PORT }}:${{ env.DEFAULT_PORT }} \
               -e NODE_ENV=development \
-              -e VIRTUAL_HOST=${{ secrets.DEV_DOMAIN }} \
+              -e VIRTUAL_HOST=${{ secrets.DOMAIN }} \
               -e VIRTUAL_PORT=${{ env.DEFAULT_PORT }} \
-              -e LETSENCRYPT_HOST=${{ secrets.DEV_DOMAIN }} \
+              -e LETSENCRYPT_HOST=${{ secrets.DOMAIN }} \
               -e LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }} \
-              -v ${{ secrets.DEPLOY_PATH }}/data:/app/data \
-              -v ${{ secrets.DEPLOY_PATH }}/logs:/app/logs \
+              -v $DEPLOY_PATH/data:/app/data \
+              -v $DEPLOY_PATH/logs:/app/logs \
               --network ${{ secrets.DOCKER_NETWORK }} \
               ${IMAGE_NAME}
             
@@ -148,7 +150,7 @@ jobs:
           port: 22
           script: |
             # Set variables
-            APP_NAME="${{ env.APP_NAME }}"
+            APP_NAME="${{ secrets.APP_NAME }}"
             CONTAINER_NAME="${APP_NAME}-dev"
             
             # Wait for the container to be ready
@@ -168,7 +170,7 @@ jobs:
               
               # Then check using the domain (this might not work immediately due to DNS propagation)
               echo "Attempting domain health check (may not work immediately due to DNS propagation)"
-              if curl -s https://${{ secrets.DEV_DOMAIN }} -k | grep -q "Hello"; then
+              if curl -s https://${{ secrets.DOMAIN }} -k | grep -q "Hello"; then
                 echo "Domain health check passed"
               else
                 echo "Warning: Domain health check did not detect expected content"
@@ -185,7 +187,7 @@ jobs:
         run: |
           if [ "${{ job.status }}" == "success" ]; then
             echo "✅ Deployment to development was successful!"
-            echo "App is now available at https://${{ secrets.DEV_DOMAIN }}"
+            echo "App is now available at https://${{ secrets.DOMAIN }}"
             echo "Deployment path on server: ${{ secrets.DEPLOY_PATH }}"
           else
             echo "❌ Deployment to development failed."
