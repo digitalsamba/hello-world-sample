@@ -97,52 +97,37 @@ jobs:
           port: 22
           script: |
             # Create deployment directory if it doesn't exist
-            mkdir -p ${{ secrets.DEPLOY_PATH }}
+            sudo mkdir -p ${{ secrets.DEPLOY_PATH }}
             cd ${{ secrets.DEPLOY_PATH }}
             
-            # Create or update docker-compose.yml
-            cat > docker-compose.yml << EOL
-            version: '3'
-            
-            services:
-              app:
-                image: docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
-                container_name: hello-world-app-dev
-                restart: unless-stopped
-                ports:
-                  - "${{ secrets.PORT }}:3000"
-                environment:
-                  - NODE_ENV=development
-                  - VIRTUAL_HOST=${{ secrets.DEV_DOMAIN }}
-                  - VIRTUAL_PORT=3000
-                  - LETSENCRYPT_HOST=${{ secrets.DEV_DOMAIN }}
-                  - LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
-                volumes:
-                  - ${{ secrets.DEPLOY_PATH }}/data:/app/data
-                  - ${{ secrets.DEPLOY_PATH }}/logs:/app/logs
-                networks:
-                  - ${{ secrets.DOCKER_NETWORK }}
-            
-            networks:
-              ${{ secrets.DOCKER_NETWORK }}:
-                external: true
-            EOL
+            # Create directories for persistent data if they don't exist
+            sudo mkdir -p ${{ secrets.DEPLOY_PATH }}/data
+            sudo mkdir -p ${{ secrets.DEPLOY_PATH }}/logs
             
             # Pull the latest image
-            docker pull docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
+            sudo docker pull docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
             
-            # Create directories for persistent data if they don't exist
-            mkdir -p ${{ secrets.DEPLOY_PATH }}/data
-            mkdir -p ${{ secrets.DEPLOY_PATH }}/logs
+            # Stop and remove any existing container with the same name
+            sudo docker stop hello-world-app-dev || true
+            sudo docker rm hello-world-app-dev || true
             
-            # Stop and remove existing containers
-            docker-compose down || true
-            
-            # Start the new container
-            docker-compose up -d
+            # Run the new container with docker run
+            sudo docker run -d \
+              --name hello-world-app-dev \
+              --restart unless-stopped \
+              -p ${{ secrets.PORT }}:3000 \
+              -e NODE_ENV=development \
+              -e VIRTUAL_HOST=${{ secrets.DEV_DOMAIN }} \
+              -e VIRTUAL_PORT=3000 \
+              -e LETSENCRYPT_HOST=${{ secrets.DEV_DOMAIN }} \
+              -e LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }} \
+              -v ${{ secrets.DEPLOY_PATH }}/data:/app/data \
+              -v ${{ secrets.DEPLOY_PATH }}/logs:/app/logs \
+              --network ${{ secrets.DOCKER_NETWORK }} \
+              docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
             
             # Clean up old images to save space (keep last 5)
-            docker image prune -a --filter "label=name=hello-world-app" --filter "until=240h" --force
+            sudo docker image prune -a --filter "label=name=hello-world-app" --filter "until=240h" --force
           
       - name: Verify deployment
         uses: appleboy/ssh-action@master
@@ -156,7 +141,7 @@ jobs:
             sleep 15
             
             # Check if the container is running
-            if docker ps | grep hello-world-app-dev; then
+            if sudo docker ps | grep hello-world-app-dev; then
               echo "Container is running"
               
               # Perform a basic health check
@@ -177,7 +162,7 @@ jobs:
               fi
             else
               echo "Container is not running"
-              docker-compose logs
+              sudo docker logs hello-world-app-dev
               exit 1
             fi
             
