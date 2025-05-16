@@ -1,4 +1,4 @@
-name: Deploy Hello World App to Development
+name: Deploy to Development Environment
 
 on:
   push:
@@ -12,6 +12,11 @@ on:
         type: choice
         options:
           - development
+
+# Application-specific configurations
+env:
+  APP_NAME: hello-world-app  # Change this for different applications
+  DEFAULT_PORT: 3000         # Default internal port the app listens on
 
 jobs:
   lint-and-test:
@@ -75,8 +80,8 @@ jobs:
           context: .
           push: true
           tags: |
-            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
-            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:development
+            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${{ env.APP_NAME }}:dev-${{ github.sha }}
+            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${{ env.APP_NAME }}:development
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -96,6 +101,11 @@ jobs:
           key: ${{ secrets.SERVER_KEY }}
           port: 22
           script: |
+            # Set variables
+            APP_NAME="${{ env.APP_NAME }}"
+            CONTAINER_NAME="${APP_NAME}-dev"
+            IMAGE_NAME="docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/${{ env.APP_NAME }}:dev-${{ github.sha }}"
+            
             # Create deployment directory if it doesn't exist
             sudo mkdir -p ${{ secrets.DEPLOY_PATH }}
             cd ${{ secrets.DEPLOY_PATH }}
@@ -105,29 +115,29 @@ jobs:
             sudo mkdir -p ${{ secrets.DEPLOY_PATH }}/logs
             
             # Pull the latest image
-            sudo docker pull docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
+            sudo docker pull ${IMAGE_NAME}
             
             # Stop and remove any existing container with the same name
-            sudo docker stop hello-world-app-dev || true
-            sudo docker rm hello-world-app-dev || true
+            sudo docker stop ${CONTAINER_NAME} || true
+            sudo docker rm ${CONTAINER_NAME} || true
             
             # Run the new container with docker run
             sudo docker run -d \
-              --name hello-world-app-dev \
+              --name ${CONTAINER_NAME} \
               --restart unless-stopped \
-              -p ${{ secrets.PORT }}:3000 \
+              -p ${{ secrets.PORT }}:${{ env.DEFAULT_PORT }} \
               -e NODE_ENV=development \
               -e VIRTUAL_HOST=${{ secrets.DEV_DOMAIN }} \
-              -e VIRTUAL_PORT=3000 \
+              -e VIRTUAL_PORT=${{ env.DEFAULT_PORT }} \
               -e LETSENCRYPT_HOST=${{ secrets.DEV_DOMAIN }} \
               -e LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }} \
               -v ${{ secrets.DEPLOY_PATH }}/data:/app/data \
               -v ${{ secrets.DEPLOY_PATH }}/logs:/app/logs \
               --network ${{ secrets.DOCKER_NETWORK }} \
-              docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
+              ${IMAGE_NAME}
             
             # Clean up old images to save space (keep last 5)
-            sudo docker image prune -a --filter "label=name=hello-world-app" --filter "until=240h" --force
+            sudo docker image prune -a --filter "label=name=${APP_NAME}" --filter "until=240h" --force
           
       - name: Verify deployment
         uses: appleboy/ssh-action@master
@@ -137,32 +147,36 @@ jobs:
           key: ${{ secrets.SERVER_KEY }}
           port: 22
           script: |
+            # Set variables
+            APP_NAME="${{ env.APP_NAME }}"
+            CONTAINER_NAME="${APP_NAME}-dev"
+            
             # Wait for the container to be ready
             sleep 15
             
             # Check if the container is running
-            if sudo docker ps | grep hello-world-app-dev; then
+            if sudo docker ps | grep ${CONTAINER_NAME}; then
               echo "Container is running"
               
               # Perform a basic health check
               # First check using local connection on the server
-              if curl -s http://localhost:3000 | grep -q "Hello World"; then
+              if curl -s http://localhost:${{ env.DEFAULT_PORT }} | grep -q "Hello"; then
                 echo "Local health check passed"
               else
-                echo "Warning: Local health check did not detect 'Hello World' text"
+                echo "Warning: Local health check did not detect expected content"
               fi
               
               # Then check using the domain (this might not work immediately due to DNS propagation)
               echo "Attempting domain health check (may not work immediately due to DNS propagation)"
-              if curl -s https://${{ secrets.DEV_DOMAIN }} -k | grep -q "Hello World"; then
+              if curl -s https://${{ secrets.DEV_DOMAIN }} -k | grep -q "Hello"; then
                 echo "Domain health check passed"
               else
-                echo "Warning: Domain health check did not detect 'Hello World' text"
+                echo "Warning: Domain health check did not detect expected content"
                 echo "This might be normal if DNS hasn't propagated or SSL certificate isn't ready yet"
               fi
             else
               echo "Container is not running"
-              sudo docker logs hello-world-app-dev
+              sudo docker logs ${CONTAINER_NAME}
               exit 1
             fi
             
