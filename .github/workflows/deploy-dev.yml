@@ -13,18 +13,6 @@ on:
         options:
           - development
 
-env:
-  IMAGE_NAME: hello-world-app
-  IMAGE_TAG: dev-${{ github.sha }}
-  DOCKER_REGISTRY: docker.io
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-  DEVELOPMENT_SERVER: ${{ secrets.DEVELOPMENT_SERVER }}
-  DOMAIN: ${{ secrets.DEV_DOMAIN }}
-  DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/apps/hello-world' }}
-  APP_PORT: 3000
-  NODE_ENV: development
-
 jobs:
   lint-and-test:
     name: Lint and Test
@@ -66,6 +54,7 @@ jobs:
     name: Build and Push Docker Image
     needs: lint-and-test
     runs-on: ubuntu-latest
+    environment: development
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -76,9 +65,9 @@ jobs:
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.DOCKER_REGISTRY }}
-          username: ${{ env.DOCKER_USERNAME }}
-          password: ${{ env.DOCKER_PASSWORD }}
+          registry: docker.io
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
           
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -86,8 +75,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:development
+            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
+            docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:development
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -102,47 +91,49 @@ jobs:
       - name: Deploy to development server
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ env.DEVELOPMENT_SERVER }}
-          username: ${{ secrets.SSH_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_KEY }}
+          port: 22
           script: |
             # Create deployment directory if it doesn't exist
-            mkdir -p ${{ env.DEPLOY_PATH }}
-            cd ${{ env.DEPLOY_PATH }}
+            mkdir -p ${{ secrets.DEPLOY_PATH }}
+            cd ${{ secrets.DEPLOY_PATH }}
             
             # Create or update docker-compose.yml
-            cat > docker-compose.yml << 'EOL'
+            cat > docker-compose.yml << EOL
             version: '3'
             
             services:
               app:
-                image: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-                container_name: ${{ env.IMAGE_NAME }}-dev
+                image: docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
+                container_name: hello-world-app-dev
                 restart: unless-stopped
+                ports:
+                  - "${{ secrets.PORT }}:3000"
                 environment:
-                  - NODE_ENV=${{ env.NODE_ENV }}
-                  - VIRTUAL_HOST=${{ env.DOMAIN }}
-                  - VIRTUAL_PORT=${{ env.APP_PORT }}
-                  - LETSENCRYPT_HOST=${{ env.DOMAIN }}
+                  - NODE_ENV=development
+                  - VIRTUAL_HOST=${{ secrets.DEV_DOMAIN }}
+                  - VIRTUAL_PORT=3000
+                  - LETSENCRYPT_HOST=${{ secrets.DEV_DOMAIN }}
                   - LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
                 volumes:
-                  - ${{ env.DEPLOY_PATH }}/data:/app/data
-                  - ${{ env.DEPLOY_PATH }}/logs:/app/logs
+                  - ${{ secrets.DEPLOY_PATH }}/data:/app/data
+                  - ${{ secrets.DEPLOY_PATH }}/logs:/app/logs
                 networks:
-                  - nginx-proxy
+                  - ${{ secrets.DOCKER_NETWORK }}
             
             networks:
-              nginx-proxy:
+              ${{ secrets.DOCKER_NETWORK }}:
                 external: true
             EOL
             
             # Pull the latest image
-            docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            docker pull docker.io/${{ secrets.DOCKER_HUB_USERNAME }}/hello-world-app:dev-${{ github.sha }}
             
             # Create directories for persistent data if they don't exist
-            mkdir -p ${{ env.DEPLOY_PATH }}/data
-            mkdir -p ${{ env.DEPLOY_PATH }}/logs
+            mkdir -p ${{ secrets.DEPLOY_PATH }}/data
+            mkdir -p ${{ secrets.DEPLOY_PATH }}/logs
             
             # Stop and remove existing containers
             docker-compose down || true
@@ -151,26 +142,26 @@ jobs:
             docker-compose up -d
             
             # Clean up old images to save space (keep last 5)
-            docker image prune -a --filter "label=name=${{ env.IMAGE_NAME }}" --filter "until=240h" --force
+            docker image prune -a --filter "label=name=hello-world-app" --filter "until=240h" --force
           
       - name: Verify deployment
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ env.DEVELOPMENT_SERVER }}
-          username: ${{ secrets.SSH_USERNAME }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_KEY }}
+          port: 22
           script: |
             # Wait for the container to be ready
             sleep 15
             
             # Check if the container is running
-            if docker ps | grep ${{ env.IMAGE_NAME }}-dev; then
+            if docker ps | grep hello-world-app-dev; then
               echo "Container is running"
               
               # Perform a basic health check
               # First check using local connection on the server
-              if curl -s http://localhost:${{ env.APP_PORT }} | grep -q "Hello World"; then
+              if curl -s http://localhost:3000 | grep -q "Hello World"; then
                 echo "Local health check passed"
               else
                 echo "Warning: Local health check did not detect 'Hello World' text"
@@ -178,7 +169,7 @@ jobs:
               
               # Then check using the domain (this might not work immediately due to DNS propagation)
               echo "Attempting domain health check (may not work immediately due to DNS propagation)"
-              if curl -s https://${{ env.DOMAIN }} -k | grep -q "Hello World"; then
+              if curl -s https://${{ secrets.DEV_DOMAIN }} -k | grep -q "Hello World"; then
                 echo "Domain health check passed"
               else
                 echo "Warning: Domain health check did not detect 'Hello World' text"
@@ -195,8 +186,8 @@ jobs:
         run: |
           if [ "${{ job.status }}" == "success" ]; then
             echo "✅ Deployment to development was successful!"
-            echo "App is now available at https://${{ env.DOMAIN }}"
-            echo "Deployment path on server: ${{ env.DEPLOY_PATH }}"
+            echo "App is now available at https://${{ secrets.DEV_DOMAIN }}"
+            echo "Deployment path on server: ${{ secrets.DEPLOY_PATH }}"
           else
             echo "❌ Deployment to development failed."
           fi
