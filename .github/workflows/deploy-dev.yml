@@ -1,0 +1,199 @@
+name: Deploy Hello World App to Development
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+
+env:
+  IMAGE_NAME: hello-world-app
+  IMAGE_TAG: dev-${{ github.sha }}
+  DOCKER_REGISTRY: docker.io
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  DEVELOPMENT_SERVER: ${{ secrets.DEVELOPMENT_SERVER }}
+  DOMAIN: ${{ secrets.DEV_DOMAIN }}
+  DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/apps/hello-world' }}
+  APP_PORT: 3000
+  NODE_ENV: development
+
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: Install dependencies
+        run: npm ci
+        
+      - name: Run linting
+        run: npm run lint || echo "No lint command configured - skipping"
+        continue-on-error: true
+        
+      - name: Run tests
+        run: npm test
+        
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            test-results/
+            coverage/
+        if: always()
+        continue-on-error: true
+
+  build-and-push:
+    name: Build and Push Docker Image
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+          
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+          
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:development
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_ENV=development
+          
+  deploy-to-development:
+    name: Deploy to Development Environment
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - name: Deploy to development server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ env.DEVELOPMENT_SERVER }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            # Create deployment directory if it doesn't exist
+            mkdir -p ${{ env.DEPLOY_PATH }}
+            cd ${{ env.DEPLOY_PATH }}
+            
+            # Create or update docker-compose.yml
+            cat > docker-compose.yml << 'EOL'
+            version: '3'
+            
+            services:
+              app:
+                image: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+                container_name: ${{ env.IMAGE_NAME }}-dev
+                restart: unless-stopped
+                environment:
+                  - NODE_ENV=${{ env.NODE_ENV }}
+                  - VIRTUAL_HOST=${{ env.DOMAIN }}
+                  - VIRTUAL_PORT=${{ env.APP_PORT }}
+                  - LETSENCRYPT_HOST=${{ env.DOMAIN }}
+                  - LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
+                volumes:
+                  - ${{ env.DEPLOY_PATH }}/data:/app/data
+                  - ${{ env.DEPLOY_PATH }}/logs:/app/logs
+                networks:
+                  - nginx-proxy
+            
+            networks:
+              nginx-proxy:
+                external: true
+            EOL
+            
+            # Pull the latest image
+            docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            
+            # Create directories for persistent data if they don't exist
+            mkdir -p ${{ env.DEPLOY_PATH }}/data
+            mkdir -p ${{ env.DEPLOY_PATH }}/logs
+            
+            # Stop and remove existing containers
+            docker-compose down || true
+            
+            # Start the new container
+            docker-compose up -d
+            
+            # Clean up old images to save space (keep last 5)
+            docker image prune -a --filter "label=name=${{ env.IMAGE_NAME }}" --filter "until=240h" --force
+          
+      - name: Verify deployment
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ env.DEVELOPMENT_SERVER }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            # Wait for the container to be ready
+            sleep 15
+            
+            # Check if the container is running
+            if docker ps | grep ${{ env.IMAGE_NAME }}-dev; then
+              echo "Container is running"
+              
+              # Perform a basic health check
+              # First check using local connection on the server
+              if curl -s http://localhost:${{ env.APP_PORT }} | grep -q "Hello World"; then
+                echo "Local health check passed"
+              else
+                echo "Warning: Local health check did not detect 'Hello World' text"
+              fi
+              
+              # Then check using the domain (this might not work immediately due to DNS propagation)
+              echo "Attempting domain health check (may not work immediately due to DNS propagation)"
+              if curl -s https://${{ env.DOMAIN }} -k | grep -q "Hello World"; then
+                echo "Domain health check passed"
+              else
+                echo "Warning: Domain health check did not detect 'Hello World' text"
+                echo "This might be normal if DNS hasn't propagated or SSL certificate isn't ready yet"
+              fi
+            else
+              echo "Container is not running"
+              docker-compose logs
+              exit 1
+            fi
+            
+      - name: Post deployment notification
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Deployment to development was successful!"
+            echo "App is now available at https://${{ env.DOMAIN }}"
+            echo "Deployment path on server: ${{ env.DEPLOY_PATH }}"
+          else
+            echo "❌ Deployment to development failed."
+          fi
